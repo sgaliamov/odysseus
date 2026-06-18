@@ -890,6 +890,55 @@ def _omit_temperature(provider: str, model: str) -> bool:
     )
 
 
+def _token_limit_key(provider: str, model: str) -> str:
+    """Return the request field name for the output-token cap.
+
+    Newer OpenAI models (o-series, gpt-4.5, gpt-5) reject the legacy
+    ``max_tokens`` and require ``max_completion_tokens``. Azure's v1 API
+    standardizes on ``max_completion_tokens`` across its models, and Azure
+    deployment names are arbitrary (e.g. ``gpt-chat-latest``), so the
+    model-name heuristic below can't be relied on there — default the whole
+    provider to the modern field. Everything else keeps ``max_tokens`` for
+    backwards-compatibility with older and self-hosted OpenAI-compatible
+    servers that only recognize that field.
+    """
+    if provider == "azure" or _uses_max_completion_tokens(model):
+        return "max_completion_tokens"
+    return "max_tokens"
+
+
+def _repair_unsupported_param(payload: Dict, body: str) -> bool:
+    """Adjust an OpenAI-compatible request ``payload`` in place after an HTTP
+    400 that rejected a specific parameter, returning True when something
+    changed so the caller can retry once.
+
+    Azure/OpenAI reasoning models reject ``max_tokens`` (they require
+    ``max_completion_tokens``) and any non-default ``temperature``. Azure
+    deployment names are arbitrary, so these constraints can't be detected from
+    the model name up front — recover from the error instead. Both fixes are
+    idempotent: once the offending field is renamed/removed, an identical 400
+    won't change anything further and the retry stops.
+    """
+    low = (body or "").lower()
+    changed = False
+    # Token-limit field-name mismatch: "'max_tokens' is not supported with this
+    # model. Use 'max_completion_tokens' instead."
+    if "max_completion_tokens" in low and "max_tokens" in payload:
+        payload["max_completion_tokens"] = payload.pop("max_tokens")
+        changed = True
+    # Temperature only-default constraint: "Only the default (1) value is
+    # supported" / "'temperature' is not supported with this model."
+    if "temperature" in payload and "temperature" in low and any(
+        kw in low for kw in (
+            "does not support", "is not supported", "unsupported",
+            "only the default", "only supports the default",
+        )
+    ):
+        payload.pop("temperature", None)
+        changed = True
+    return changed
+
+
 # Anthropic removed the sampling parameters (temperature, top_p, top_k) starting
 # with Claude Opus 4.7. On Opus 4.7 and later, sending `temperature` at all —
 # even 0.0 — returns HTTP 400. Earlier Claude models (Opus 4.6 and below, every
@@ -1441,8 +1490,7 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
         if _omit_temperature(provider, model):
             payload.pop("temperature", None)
         if max_tokens and max_tokens > 0:
-            tok_key = "max_completion_tokens" if _uses_max_completion_tokens(model) else "max_tokens"
-            payload[tok_key] = max_tokens
+            payload[_token_limit_key(provider, model)] = max_tokens
     try:
         note_model_activity(target_url, model)
         r = httpx_post_kimi_aware(target_url, h, json=payload, timeout=timeout)
@@ -1635,8 +1683,7 @@ async def llm_call_async(
         if _omit_temperature(provider, model):
             payload.pop("temperature", None)
         if max_tokens and max_tokens > 0:
-            tok_key = "max_completion_tokens" if _uses_max_completion_tokens(model) else "max_tokens"
-            payload[tok_key] = max_tokens
+            payload[_token_limit_key(provider, model)] = max_tokens
         # Suppress thinking for qwen3/gemma4 on Ollama /v1 — same as stream_llm.
         if _is_ollama_openai_compat_url(url) and _supports_thinking(model):
             payload["think"] = False
@@ -1663,6 +1710,13 @@ async def llm_call_async(
                 )
                 if r.status_code in (429, 502, 503, 504) and attempt < max_retries:
                     await asyncio.sleep(LLMConfig.RETRY_DELAY)
+                    continue
+                # A reasoning model reachable under an opaque name (common on
+                # Azure, where deployments are renamed) can 400 on max_tokens or
+                # a non-default temperature. Repair the payload from the error
+                # text and retry once instead of failing the whole call.
+                if r.status_code == 400 and attempt < max_retries and _repair_unsupported_param(payload, r.text):
+                    logger.info(f"Retrying {target_url} after adjusting an unsupported parameter")
                     continue
                 raise HTTPException(r.status_code, friendly)
             logger.info(f"LLM async call to {target_url} succeeded in {duration:.2f}s (attempt {attempt})")
@@ -1754,8 +1808,7 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
         if provider not in {"openrouter", "groq"}:
             payload["stream_options"] = {"include_usage": True}
         if max_tokens and max_tokens > 0:
-            tok_key = "max_completion_tokens" if _uses_max_completion_tokens(model) else "max_tokens"
-            payload[tok_key] = max_tokens
+            payload[_token_limit_key(provider, model)] = max_tokens
         if tools:
             payload["tools"] = tools
         # For Ollama's OpenAI-compat /v1 endpoint with thinking models (qwen3,
