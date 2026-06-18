@@ -779,6 +779,12 @@ function initEndpointForm() {
   function _isDeviceAuthSelected() {
     return !!_selectedDeviceAuthProvider();
   }
+  // Azure AI is a sentinel option (value "azure") rather than a fixed base URL,
+  // because each Azure resource has its own subdomain. When selected the URL
+  // field stays editable and an extra deployment/model-name field is shown.
+  function _isAzureSelected() {
+    return !!provider && provider.value === 'azure';
+  }
   function _setApiFormForProvider() {
     const deviceAuthProvider = _selectedDeviceAuthProvider();
     const deviceAuthConfig = PROVIDER_DEVICE_FLOWS[deviceAuthProvider] || null;
@@ -838,6 +844,14 @@ function initEndpointForm() {
       }
       if (!deviceAuthPolling && status) status.textContent = '';
     }
+    // Azure AI: show the deployment/model field and an Azure-specific
+    // placeholder; the URL stays editable so each resource subdomain works.
+    const azureRow = el('adm-epAzureModel-row');
+    if (azureRow) azureRow.style.display = _isAzureSelected() ? '' : 'none';
+    if (_isAzureSelected()) {
+      urlInput.readOnly = false;
+      urlInput.placeholder = 'https://<resource>.services.ai.azure.com/openai/v1';
+    }
   }
   function _renderPickerMenu() {
     if (!pickerMenu) return;
@@ -894,13 +908,21 @@ function initEndpointForm() {
       _syncPickerCurrent();
       return;
     }
+    if (_isAzureSelected()) {
+      // Don't paste the "azure" sentinel into the URL box — leave it empty so
+      // the placeholder prompts for the resource URL.
+      urlInput.value = '';
+      if (kindSel) kindSel.value = 'api';
+      _setApiFormForProvider();
+      return;
+    }
     if (provider.value) urlInput.value = provider.value;
     else urlInput.value = '';
     if (kindSel) kindSel.value = provider.value ? 'api' : 'proxy';
     _setApiFormForProvider();
   });
   urlInput.addEventListener('input', () => {
-    if (provider.value && urlInput.value.trim() !== provider.value) {
+    if (provider.value && provider.value !== 'azure' && urlInput.value.trim() !== provider.value) {
       provider.value = '';
       if (kindSel) kindSel.value = 'api';
       _renderPickerMenu();
@@ -922,6 +944,17 @@ function initEndpointForm() {
     if (!/^https?:\/\//.test(u)) u = 'http://' + u;
     // Strip trailing slashes
     u = u.replace(/\/+$/, '');
+    // Azure AI / Azure OpenAI: the v1 API base is always {origin}/openai/v1,
+    // regardless of any deployment or chat path that was pasted in. Force it (over
+    // HTTPS, which Azure requires) so the OpenAI-compatible request builders land
+    // on /openai/v1/chat/completions.
+    try {
+      const au = new URL(u);
+      const ah = au.hostname.toLowerCase();
+      if (ah.endsWith('.openai.azure.com') || ah.endsWith('.services.ai.azure.com') || ah.endsWith('.cognitiveservices.azure.com')) {
+        return 'https://' + au.host + '/openai/v1';
+      }
+    } catch (e) {}
     // Strip trailing paths that shouldn't be in a base URL
     u = u.replace(/\/v1\/(models|chat\/completions|completions|messages)\/?$/i, '/v1');
     u = u.replace(/\/(models|chat\/completions|completions|v1\/messages)\/?$/i, '');
@@ -993,7 +1026,7 @@ function initEndpointForm() {
       }
       const msg = _endpointMsg('api');
       msg.textContent = ''; msg.className = '';
-      const rawUrl = (urlInput.value || provider.value).trim();
+      const rawUrl = (urlInput.value || (_isAzureSelected() ? '' : provider.value)).trim();
       const apiKey = el('adm-epApiKey').value.trim();
       if (!rawUrl) { msg.textContent = 'Select a provider or enter a base URL'; msg.className = 'admin-error'; return; }
       if (provider.value && !apiKey) { msg.textContent = 'API key is required for cloud providers'; msg.className = 'admin-error'; return; }
@@ -1045,7 +1078,7 @@ function initEndpointForm() {
     }
     const msg = _endpointMsg('api');
     msg.textContent = ''; msg.className = '';
-    const rawUrl = (urlInput.value || provider.value).trim();
+    const rawUrl = (urlInput.value || (_isAzureSelected() ? '' : provider.value)).trim();
     const apiKey = el('adm-epApiKey').value.trim();
     if (!rawUrl) { msg.textContent = 'Select a provider or enter a base URL'; msg.className = 'admin-error'; return; }
     if (provider.value && !apiKey) { msg.textContent = 'API key is required for cloud providers'; msg.className = 'admin-error'; return; }
@@ -1063,6 +1096,12 @@ function initEndpointForm() {
       if (apiKey) fd.append('api_key', apiKey);
       if (provider.value && provider.selectedOptions && provider.selectedOptions[0]) {
         fd.append('name', provider.selectedOptions[0].textContent.trim());
+      }
+      if (_isAzureSelected()) {
+        // Pin the deployment/model name the user typed so it's immediately
+        // selectable even if model discovery returns nothing.
+        const azModel = ((el('adm-epAzureModel') && el('adm-epAzureModel').value) || '').trim();
+        if (azModel) fd.append('pinned_models', azModel);
       }
       const epType = el('adm-epType');
       if (epType) fd.append('model_type', epType.value);
